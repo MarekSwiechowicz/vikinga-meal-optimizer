@@ -86,6 +86,8 @@ function scoreForUC(details) {
       const scored = changeable.map(o => ({ ...o, score: scoreForUC(o.menuMealDetails) }));
       const best = scored.reduce((a, b) => a.score > b.score ? a : b);
 
+      if (best.menuMealDetails.dietCaloriesMealId === meal.dietCaloriesMealId) continue;
+
       changes.push({
         date: delivery.date,
         mealName: best.menuMealDetails.mealName,
