@@ -10,10 +10,10 @@ if (!EMAIL || !PASSWORD) {
   process.exit(1);
 }
 
-function scoreForUC(meal) {
-  const n = meal.nutrition;
+function scoreForUC(details) {
+  const n = details.nutrition;
   let score = (n.protein * 3) - (n.fat * 2) - (n.sugar * 1.5);
-  const name = meal.menuMealName.toLowerCase();
+  const name = details.menuMealName.toLowerCase();
 
   if (name.includes('mintaj') || name.includes('łosoś') ||
       name.includes('dorsz') || name.includes('tuńczyk') ||
@@ -42,10 +42,7 @@ function scoreForUC(meal) {
   await page.waitForTimeout(2000);
 
   const cookieBtn = await page.$('text=Zezwól na wszystkie');
-  if (cookieBtn) {
-    await cookieBtn.click();
-    await page.waitForTimeout(1000);
-  }
+  if (cookieBtn) { await cookieBtn.click(); await page.waitForTimeout(1000); }
 
   await page.fill('input[name="username"]', EMAIL);
   await page.fill('input[name="password"]', PASSWORD);
@@ -68,8 +65,13 @@ function scoreForUC(meal) {
   const changes = [];
 
   for (const delivery of deliveries) {
-    const meals = delivery.deliveryMeals || [];
+    const meals = Array.isArray(delivery.deliveryMeals)
+      ? delivery.deliveryMeals
+      : delivery.deliveryMeals ? [delivery.deliveryMeals] : [];
+
     for (const meal of meals) {
+      if (meal.deleted) continue;
+
       const switchData = await page.evaluate(async ({ orderId, deliveryId, deliveryMealId }) => {
         const res = await fetch(
           `/api/company/customer/order/${orderId}/deliveries/${deliveryId}/delivery-meals/${deliveryMealId}/switch`
@@ -78,33 +80,30 @@ function scoreForUC(meal) {
       }, { orderId: ORDER_ID, deliveryId: delivery.deliveryId, deliveryMealId: meal.deliveryMealId });
 
       const options = switchData.mealChangeOptions || [];
-      if (options.length === 0) continue;
+      const changeable = options.filter(o => o.canBeChanged && o.menuMealDetails);
+      if (changeable.length === 0) continue;
 
-      const scored = options.map(o => ({ ...o, score: scoreForUC(o) }));
-      const current = { menuMealName: meal.menuMealName, nutrition: meal.nutrition };
-      current.score = scoreForUC(current);
-
+      const scored = changeable.map(o => ({ ...o, score: scoreForUC(o.menuMealDetails) }));
       const best = scored.reduce((a, b) => a.score > b.score ? a : b);
 
-      if (best.score > current.score) {
-        changes.push({
-          date: delivery.date,
-          meal: meal.menuMealName,
-          bestMeal: best.menuMealName,
-          deliveryId: delivery.deliveryId,
-          deliveryMealId: meal.deliveryMealId,
-          bestDietCaloriesMealId: best.dietCaloriesMealId,
-          scoreDiff: best.score - current.score,
-        });
-      }
+      changes.push({
+        date: delivery.date,
+        mealName: best.menuMealDetails.mealName,
+        bestMeal: best.menuMealDetails.menuMealName,
+        deliveryId: delivery.deliveryId,
+        deliveryMealId: meal.deliveryMealId,
+        bestDietCaloriesMealId: best.menuMealDetails.dietCaloriesMealId,
+        score: best.score,
+      });
     }
   }
 
-  console.log(`\n${changes.length} changes to make:`);
+  console.log(`\n${changes.length} meals to optimize:`);
   for (const c of changes) {
-    console.log(`  [${c.date}] ${c.meal} -> ${c.bestMeal} (+${c.scoreDiff.toFixed(1)} pts)`);
+    console.log(`  [${c.date}] ${c.mealName}: ${c.bestMeal} (score: ${c.score.toFixed(1)})`);
   }
 
+  console.log('\nApplying changes...');
   for (const c of changes) {
     const result = await page.evaluate(async ({ orderId, deliveryId, deliveryMealId, dietCaloriesMealId }) => {
       const res = await fetch(
@@ -114,7 +113,8 @@ function scoreForUC(meal) {
       return { status: res.status };
     }, { orderId: ORDER_ID, deliveryId: c.deliveryId, deliveryMealId: c.deliveryMealId, dietCaloriesMealId: c.bestDietCaloriesMealId });
 
-    console.log(`  [${c.date}] ${result.status === 200 ? 'OK' : 'FAILED'} ${c.meal} -> ${c.bestMeal}`);
+    const ok = result.status === 200 || result.status === 204;
+    console.log(`  [${c.date}] ${ok ? 'OK' : `FAILED (${result.status})`} ${c.mealName}: ${c.bestMeal}`);
   }
 
   await browser.close();
