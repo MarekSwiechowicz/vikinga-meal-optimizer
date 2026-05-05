@@ -15,7 +15,7 @@ function scoreForUC(details) {
   let score = (n.protein * 3) - (n.fat * 2) - (n.sugar * 1.5);
   const name = details.menuMealName.toLowerCase();
 
-  if (name.includes('mintaj') || name.includes('łosoś') ||
+  if (name.includes('mintaj') || name.includes('ryba') || name.includes('łosoś') ||
       name.includes('dorsz') || name.includes('tuńczyk') ||
       name.includes('pstrąg')) score += 20;
 
@@ -76,14 +76,14 @@ function scoreForUC(details) {
         const res = await fetch(
           `/api/company/customer/order/${orderId}/deliveries/${deliveryId}/delivery-meals/${deliveryMealId}/switch`
         );
+        if (!res.ok) return { mealChangeOptions: [] };
         return res.json();
       }, { orderId: ORDER_ID, deliveryId: delivery.deliveryId, deliveryMealId: meal.deliveryMealId });
 
-      const options = switchData.mealChangeOptions || [];
-      const changeable = options.filter(o => o.canBeChanged && o.menuMealDetails);
-      if (changeable.length === 0) continue;
+      const options = (switchData.mealChangeOptions || []).filter(o => o.menuMealDetails);
+      if (options.length === 0) continue;
 
-      const scored = changeable.map(o => ({ ...o, score: scoreForUC(o.menuMealDetails) }));
+      const scored = options.map(o => ({ ...o, score: scoreForUC(o.menuMealDetails) }));
       const best = scored.reduce((a, b) => a.score > b.score ? a : b);
 
       if (best.menuMealDetails.dietCaloriesMealId === meal.dietCaloriesMealId) continue;
