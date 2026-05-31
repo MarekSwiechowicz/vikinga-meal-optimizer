@@ -14,8 +14,8 @@ Automatically selects the best meal options on [panel.kuchniavikinga.pl](https:/
 ## Setup
 
 ```bash
-yarn install
-yarn playwright install chromium
+npm install
+npx playwright install chromium
 cp .env.example .env
 # Fill in your credentials in .env
 ```
