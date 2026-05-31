@@ -1,36 +1,53 @@
 require('dotenv').config();
 const { chromium } = require('playwright');
+const Groq = require('groq-sdk');
 
-const ORDER_ID = '3003629';
 const EMAIL = process.env.VIKINGA_EMAIL;
 const PASSWORD = process.env.VIKINGA_PASSWORD;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 if (!EMAIL || !PASSWORD) {
   console.error('Missing VIKINGA_EMAIL or VIKINGA_PASSWORD in .env');
   process.exit(1);
 }
+if (!GROQ_API_KEY) {
+  console.error('Missing GROQ_API_KEY in .env');
+  process.exit(1);
+}
 
-function scoreForUC(details) {
-  const n = details.nutrition;
-  let score = (n.protein * 3) - (n.fat * 2) - (n.sugar * 1.5);
-  const name = details.menuMealName.toLowerCase();
+const groq = new Groq({ apiKey: GROQ_API_KEY });
 
-  if (name.includes('mintaj') || name.includes('ryba') || name.includes('łosoś') ||
-      name.includes('dorsz') || name.includes('tuńczyk') ||
-      name.includes('pstrąg')) score += 20;
+function formatMeal(d, i) {
+  const n = d.nutrition;
+  const ingredients = (d.ingredients || []).map(ing => ing.name).join(', ');
+  return [
+    `${i + 1}. ${d.menuMealName}`,
+    `   Makro: białko ${n.protein}g, tłuszcz ${n.fat}g (nasycone ${n.saturatedFattyAcids}g), węglowodany ${n.carbohydrate}g, błonnik ${n.dietaryFiber}g, cukier ${n.sugar}g, sól ${n.salt}g, ${n.calories} kcal`,
+    `   Składniki: ${ingredients}`,
+  ].join('\n');
+}
 
-  if (name.includes('kurczak') || name.includes('indyk') ||
-      name.includes('drobiow')) score += 5;
+async function pickBestForUC(options) {
+  const list = options.map((o, i) => formatMeal(o.menuMealDetails, i)).join('\n\n');
 
-  if (name.includes('curry') || name.includes('hariss') ||
-      name.includes('chili') || name.includes('pikant')) score -= 15;
+  const completion = await groq.chat.completions.create({
+    model: 'llama-3.3-70b-versatile',
+    messages: [{
+      role: 'user',
+      content: `Pacjent choruje na wrzodziejące zapalenie jelita grubego (WZJG/UC).
+Wybierz JEDEN najlepszy posiłek z poniższej listy.
+Preferuj: wysokie białko, mało błonnika nierozpuszczalnego, chude mięso (drób, ryby), lekkostrawne składniki.
+Unikaj: pikantnych przypraw (chili, curry, harissa), przetworzonego mięsa (chorizo, boczek, kiełbasa), tłuszczów nasyconych, surowych warzyw w dużych ilościach.
+Odpowiedz TYLKO cyfrą (np. 3) bez żadnego dodatkowego tekstu.
 
-  if (name.includes('sos pomidorowy') || name.includes('pomidorow')) score -= 10;
+${list}`
+    }],
+    max_tokens: 5,
+  });
 
-  if (name.includes('boczek') || name.includes('pepperoni') ||
-      name.includes('kiełbas')) score -= 10;
-
-  return score;
+  const text = completion.choices[0].message.content.trim();
+  const idx = parseInt(text) - 1;
+  return (idx >= 0 && idx < options.length) ? idx : 0;
 }
 
 (async () => {
@@ -50,17 +67,32 @@ function scoreForUC(details) {
   await page.waitForTimeout(6000);
   console.log('Logged in.');
 
+  const activeIds = await page.evaluate(async () => {
+    const res = await fetch('/api/company/customer/order/active-ids');
+    return res.json();
+  });
+
+  if (!activeIds || activeIds.length === 0) {
+    console.error('No active orders found.');
+    await browser.close();
+    return;
+  }
+
+  const ORDER_ID = String(activeIds[0]);
+  console.log(`Active order: ${ORDER_ID}`);
+
   const order = await page.evaluate(async (orderId) => {
     const res = await fetch(`/api/company/customer/order/${orderId}`);
     return res.json();
   }, ORDER_ID);
 
   const today = new Date().toISOString().split('T')[0];
+  const filterDate = process.argv[2] || null;
   const deliveries = order.deliveries
-    .filter(d => d.date >= today && !d.deleted)
+    .filter(d => !d.deleted && (filterDate ? d.date === filterDate : d.date >= today))
     .sort((a, b) => a.date.localeCompare(b.date));
 
-  console.log(`Found ${deliveries.length} upcoming deliveries`);
+  console.log(`Found ${deliveries.length} upcoming deliveries\n`);
 
   const changes = [];
 
@@ -83,8 +115,10 @@ function scoreForUC(details) {
       const options = (switchData.mealChangeOptions || []).filter(o => o.menuMealDetails);
       if (options.length === 0) continue;
 
-      const scored = options.map(o => ({ ...o, score: scoreForUC(o.menuMealDetails) }));
-      const best = scored.reduce((a, b) => a.score > b.score ? a : b);
+      process.stdout.write(`  [${delivery.date}] Analyzing ${options[0].menuMealDetails.mealName}... `);
+      const bestIdx = await pickBestForUC(options);
+      const best = options[bestIdx];
+      console.log(`→ ${best.menuMealDetails.menuMealName}`);
 
       if (best.menuMealDetails.dietCaloriesMealId === meal.dietCaloriesMealId) continue;
 
@@ -95,14 +129,16 @@ function scoreForUC(details) {
         deliveryId: delivery.deliveryId,
         deliveryMealId: meal.deliveryMealId,
         bestDietCaloriesMealId: best.menuMealDetails.dietCaloriesMealId,
-        score: best.score,
       });
     }
   }
 
-  console.log(`\n${changes.length} meals to optimize:`);
-  for (const c of changes) {
-    console.log(`  [${c.date}] ${c.mealName}: ${c.bestMeal} (score: ${c.score.toFixed(1)})`);
+  console.log(`\n${changes.length} meals to change.`);
+
+  if (changes.length === 0) {
+    console.log('All meals already optimal.');
+    await browser.close();
+    return;
   }
 
   console.log('\nApplying changes...');
@@ -116,7 +152,7 @@ function scoreForUC(details) {
     }, { orderId: ORDER_ID, deliveryId: c.deliveryId, deliveryMealId: c.deliveryMealId, dietCaloriesMealId: c.bestDietCaloriesMealId });
 
     const ok = result.status === 200 || result.status === 204;
-    console.log(`  [${c.date}] ${ok ? 'OK' : `FAILED (${result.status})`} ${c.mealName}: ${c.bestMeal}`);
+    console.log(`  [${c.date}] ${ok ? 'OK' : `FAILED (${result.status})`} — ${c.mealName}: ${c.bestMeal}`);
   }
 
   await browser.close();

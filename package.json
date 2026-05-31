@@ -1,13 +1,16 @@
 {
   "name": "vikinga-meal-optimizer",
   "version": "1.0.0",
-  "description": "Automated meal selection for Kuchnia Vikinga catering with UC-aware scoring",
+  "description": "Automated meal selection for Kuchnia Vikinga catering with UC-aware scoring via Gemini AI",
   "main": "vikinga.js",
   "scripts": {
-    "start": "node vikinga.js"
+    "start": "node vikinga.js",
+    "verify": "node verify.js"
   },
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
     "dotenv": "^16.0.0",
+    "groq-sdk": "^1.2.1",
     "playwright": "^1.40.0"
   }
 }

@@ -1,18 +1,43 @@
 require('dotenv').config();
 const { chromium } = require('playwright');
+const Groq = require('groq-sdk');
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-const ORDER_ID = '3003629';
+function formatMeal(d, i) {
+  const n = d.nutrition;
+  const ingredients = (d.ingredients || []).map(ing => ing.name).join(', ');
+  return [
+    `${i + 1}. ${d.menuMealName}`,
+    `   Makro: białko ${n.protein}g, tłuszcz ${n.fat}g (nasycone ${n.saturatedFattyAcids}g), węglowodany ${n.carbohydrate}g, błonnik ${n.dietaryFiber}g, cukier ${n.sugar}g, sól ${n.salt}g, ${n.calories} kcal`,
+    `   Składniki: ${ingredients}`,
+  ].join('\n');
+}
 
-function scoreForUC(details) {
-  const n = details.nutrition;
-  let score = (n.protein * 3) - (n.fat * 2) - (n.sugar * 1.5);
-  const name = details.menuMealName.toLowerCase();
-  if (name.includes('mintaj') || name.includes('łosoś') || name.includes('dorsz') || name.includes('tuńczyk') || name.includes('pstrąg')) score += 20;
-  if (name.includes('kurczak') || name.includes('indyk') || name.includes('drobiow')) score += 5;
-  if (name.includes('curry') || name.includes('hariss') || name.includes('chili') || name.includes('pikant')) score -= 15;
-  if (name.includes('sos pomidorowy') || name.includes('pomidorow')) score -= 10;
-  if (name.includes('boczek') || name.includes('pepperoni') || name.includes('kiełbas')) score -= 10;
-  return score;
+async function analyzeForUC(options) {
+  const list = options.map((o, i) => formatMeal(o.menuMealDetails, i)).join('\n\n');
+
+  const completion = await groq.chat.completions.create({
+    model: 'llama-3.3-70b-versatile',
+    messages: [{
+      role: 'user',
+      content: `Pacjent choruje na wrzodziejące zapalenie jelita grubego (WZJG/UC).
+Przeanalizuj poniższe opcje posiłków i:
+1. Wskaż numer najlepszego wyboru
+2. Daj krótkie uzasadnienie (1-2 zdania) odwołując się do konkretnych składników lub wartości odżywczych
+
+Preferuj: wysokie białko, mało błonnika nierozpuszczalnego, chude mięso (drób, ryby), lekkostrawne składniki.
+Unikaj: pikantnych przypraw (chili, curry, harissa), przetworzonego mięsa (chorizo, boczek, kiełbasa), tłuszczów nasyconych, surowych warzyw w dużych ilościach.
+
+${list}
+
+Format odpowiedzi:
+WYBÓR: [numer]
+UZASADNIENIE: [tekst]`
+    }],
+    max_tokens: 200,
+  });
+
+  return completion.choices[0].message.content.trim();
 }
 
 (async () => {
@@ -27,7 +52,21 @@ function scoreForUC(details) {
   await page.fill('input[name="password"]', process.env.VIKINGA_PASSWORD);
   await page.click('button[type="submit"]');
   await page.waitForTimeout(6000);
-  console.log('Logged in.\n');
+  console.log('Logged in.');
+
+  const activeIds = await page.evaluate(async () => {
+    const res = await fetch('/api/company/customer/order/active-ids');
+    return res.json();
+  });
+
+  if (!activeIds || activeIds.length === 0) {
+    console.error('No active orders found.');
+    await browser.close();
+    return;
+  }
+
+  const ORDER_ID = String(activeIds[0]);
+  console.log(`Active order: ${ORDER_ID}\n`);
 
   const order = await page.evaluate(async (orderId) => {
     const res = await fetch(`/api/company/customer/order/${orderId}`);
@@ -35,8 +74,9 @@ function scoreForUC(details) {
   }, ORDER_ID);
 
   const today = new Date().toISOString().split('T')[0];
+  const filterDate = process.argv[2] || null;
   const deliveries = order.deliveries
-    .filter(d => d.date >= today && !d.deleted)
+    .filter(d => !d.deleted && (filterDate ? d.date === filterDate : d.date >= today))
     .sort((a, b) => a.date.localeCompare(b.date));
 
   for (const delivery of deliveries) {
@@ -44,42 +84,39 @@ function scoreForUC(details) {
       ? delivery.deliveryMeals
       : delivery.deliveryMeals ? [delivery.deliveryMeals] : [];
 
-    const switchResults = [];
+    let hasOutput = false;
 
     for (const meal of meals) {
       if (meal.deleted) continue;
 
       const sw = await page.evaluate(async ({ orderId, deliveryId, deliveryMealId }) => {
         const res = await fetch(`/api/company/customer/order/${orderId}/deliveries/${deliveryId}/delivery-meals/${deliveryMealId}/switch`);
+        if (!res.ok) return { mealChangeOptions: [] };
         return res.json();
       }, { orderId: ORDER_ID, deliveryId: delivery.deliveryId, deliveryMealId: meal.deliveryMealId });
 
       const options = (sw.mealChangeOptions || []).filter(o => o.menuMealDetails);
       if (options.length === 0) continue;
 
-      const scored = options.map(o => ({
-        name: o.menuMealDetails.menuMealName,
-        mealName: o.menuMealDetails.mealName,
-        id: o.menuMealDetails.dietCaloriesMealId,
-        score: scoreForUC(o.menuMealDetails),
-        isCurrent: o.menuMealDetails.dietCaloriesMealId === meal.dietCaloriesMealId,
-      })).sort((a, b) => b.score - a.score);
-
-      switchResults.push({ mealSlot: scored[0].mealName, scored, currentId: meal.dietCaloriesMealId });
-    }
-
-    if (switchResults.length === 0) continue;
-
-    console.log(`=== ${delivery.date} ===`);
-    for (const r of switchResults) {
-      console.log(`  ${r.mealSlot}:`);
-      for (const o of r.scored) {
-        const tag = o.isCurrent ? ' <-- CURRENT' : '';
-        const best = o.score === r.scored[0].score ? ' [BEST]' : '';
-        console.log(`    ${o.score.toFixed(1).padStart(6)} | ${o.name}${best}${tag}`);
+      if (!hasOutput) {
+        console.log(`=== ${delivery.date} ===`);
+        hasOutput = true;
       }
+
+      console.log(`\n  ${options[0].menuMealDetails.mealName}:`);
+      options.forEach((o, i) => {
+        const d = o.menuMealDetails;
+        const n = d.nutrition;
+        const current = d.dietCaloriesMealId === meal.dietCaloriesMealId ? ' <-- CURRENT' : '';
+        console.log(`    ${i + 1}. ${d.menuMealName} | B:${n.protein}g T:${n.fat}g C:${n.sugar}g${current}`);
+      });
+
+      const analysis = await analyzeForUC(options);
+      console.log(`\n  AI (WZJG):`);
+      analysis.split('\n').forEach(line => console.log(`    ${line}`));
     }
-    console.log('');
+
+    if (hasOutput) console.log('');
   }
 
   await browser.close();
