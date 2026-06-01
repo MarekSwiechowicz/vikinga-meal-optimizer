@@ -30,24 +30,61 @@ function formatMeal(d, i) {
 async function pickBestForUC(options) {
   const list = options.map((o, i) => formatMeal(o.menuMealDetails, i)).join('\n\n');
 
-  const completion = await groq.chat.completions.create({
-    model: 'llama-3.3-70b-versatile',
-    messages: [{
-      role: 'user',
-      content: `Pacjent choruje na wrzodziejące zapalenie jelita grubego (WZJG/UC).
+  while (true) {
+    try {
+      const completion = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{
+          role: 'user',
+          content: `Pacjent choruje na wrzodziejące zapalenie jelita grubego (WZJG/UC).
 Wybierz JEDEN najlepszy posiłek z poniższej listy.
 Preferuj: wysokie białko, mało błonnika nierozpuszczalnego, chude mięso (drób, ryby), lekkostrawne składniki.
 Unikaj: pikantnych przypraw (chili, curry, harissa), przetworzonego mięsa (chorizo, boczek, kiełbasa), tłuszczów nasyconych, surowych warzyw w dużych ilościach.
 Odpowiedz TYLKO cyfrą (np. 3) bez żadnego dodatkowego tekstu.
 
 ${list}`
-    }],
-    max_tokens: 5,
-  });
+        }],
+        max_tokens: 5,
+      });
+      const text = completion.choices[0].message.content.trim();
+      const idx = parseInt(text) - 1;
+      return (idx >= 0 && idx < options.length) ? idx : 0;
+    } catch (err) {
+      const isRateLimit = err.status === 429;
+      const isNetwork = !err.status;
+      if (isRateLimit || isNetwork) {
+        const match = isRateLimit && err.message && err.message.match(/try again in (\d+)m([\d.]+)s/);
+        const waitMs = match
+          ? (parseInt(match[1]) * 60 + parseFloat(match[2])) * 1000 + 2000
+          : 30000;
+        const waitMin = Math.ceil(waitMs / 60000);
+        const reason = isRateLimit ? 'rate limit' : 'brak sieci';
+        console.log(`\n  [${reason}] czekam ${waitMin} min...`);
+        await new Promise(r => setTimeout(r, waitMs));
+      } else {
+        throw err;
+      }
+    }
+  }
+}
 
-  const text = completion.choices[0].message.content.trim();
-  const idx = parseInt(text) - 1;
-  return (idx >= 0 && idx < options.length) ? idx : 0;
+async function ensureLoggedIn(page) {
+  const test = await page.evaluate(async () => {
+    const res = await fetch('/api/company/customer/order/active-ids');
+    return res.status;
+  });
+  if (test !== 200) {
+    console.log('  [sesja wygasła] loguję ponownie...');
+    await page.goto('https://panel.kuchniavikinga.pl/', { waitUntil: 'networkidle', timeout: 30000 });
+    await page.waitForTimeout(2000);
+    const cookieBtn = await page.$('text=Zezwól na wszystkie');
+    if (cookieBtn) { await cookieBtn.click(); await page.waitForTimeout(1000); }
+    await page.fill('input[name="username"]', EMAIL);
+    await page.fill('input[name="password"]', PASSWORD);
+    await page.click('button[type="submit"]');
+    await page.waitForTimeout(6000);
+    console.log('  [zalogowano ponownie]');
+  }
 }
 
 (async () => {
@@ -57,10 +94,8 @@ ${list}`
   console.log('Logging in...');
   await page.goto('https://panel.kuchniavikinga.pl/', { waitUntil: 'networkidle', timeout: 30000 });
   await page.waitForTimeout(2000);
-
   const cookieBtn = await page.$('text=Zezwól na wszystkie');
   if (cookieBtn) { await cookieBtn.click(); await page.waitForTimeout(1000); }
-
   await page.fill('input[name="username"]', EMAIL);
   await page.fill('input[name="password"]', PASSWORD);
   await page.click('button[type="submit"]');
@@ -87,14 +122,13 @@ ${list}`
   }, ORDER_ID);
 
   const today = new Date().toISOString().split('T')[0];
-  const filterDate = process.argv[2] || null;
+  const dateFrom = process.argv[2] || today;
+  const dateTo = process.argv[3] || '9999-12-31';
   const deliveries = order.deliveries
-    .filter(d => !d.deleted && (filterDate ? d.date === filterDate : d.date >= today))
+    .filter(d => !d.deleted && d.date >= dateFrom && d.date <= dateTo)
     .sort((a, b) => a.date.localeCompare(b.date));
 
   console.log(`Found ${deliveries.length} upcoming deliveries\n`);
-
-  const changes = [];
 
   for (const delivery of deliveries) {
     const meals = Array.isArray(delivery.deliveryMeals)
@@ -103,6 +137,8 @@ ${list}`
 
     for (const meal of meals) {
       if (meal.deleted) continue;
+
+      await ensureLoggedIn(page);
 
       const switchData = await page.evaluate(async ({ orderId, deliveryId, deliveryMealId }) => {
         const res = await fetch(
@@ -122,37 +158,19 @@ ${list}`
 
       if (best.menuMealDetails.dietCaloriesMealId === meal.dietCaloriesMealId) continue;
 
-      changes.push({
-        date: delivery.date,
-        mealName: best.menuMealDetails.mealName,
-        bestMeal: best.menuMealDetails.menuMealName,
-        deliveryId: delivery.deliveryId,
-        deliveryMealId: meal.deliveryMealId,
-        bestDietCaloriesMealId: best.menuMealDetails.dietCaloriesMealId,
-      });
+      await ensureLoggedIn(page);
+
+      const result = await page.evaluate(async ({ orderId, deliveryId, deliveryMealId, dietCaloriesMealId }) => {
+        const res = await fetch(
+          `/api/company/customer/order/${orderId}/deliveries/${deliveryId}/delivery-meals/${deliveryMealId}/switch?dietCaloriesMealId=${dietCaloriesMealId}`,
+          { method: 'PUT', headers: { 'Content-Type': 'application/json' } }
+        );
+        return { status: res.status };
+      }, { orderId: ORDER_ID, deliveryId: delivery.deliveryId, deliveryMealId: meal.deliveryMealId, dietCaloriesMealId: best.menuMealDetails.dietCaloriesMealId });
+
+      const ok = result.status === 200 || result.status === 204;
+      console.log(`  [${delivery.date}] ${ok ? 'OK' : `FAILED (${result.status})`} — ${options[0].menuMealDetails.mealName}: ${best.menuMealDetails.menuMealName}`);
     }
-  }
-
-  console.log(`\n${changes.length} meals to change.`);
-
-  if (changes.length === 0) {
-    console.log('All meals already optimal.');
-    await browser.close();
-    return;
-  }
-
-  console.log('\nApplying changes...');
-  for (const c of changes) {
-    const result = await page.evaluate(async ({ orderId, deliveryId, deliveryMealId, dietCaloriesMealId }) => {
-      const res = await fetch(
-        `/api/company/customer/order/${orderId}/deliveries/${deliveryId}/delivery-meals/${deliveryMealId}/switch?dietCaloriesMealId=${dietCaloriesMealId}`,
-        { method: 'PUT', headers: { 'Content-Type': 'application/json' } }
-      );
-      return { status: res.status };
-    }, { orderId: ORDER_ID, deliveryId: c.deliveryId, deliveryMealId: c.deliveryMealId, dietCaloriesMealId: c.bestDietCaloriesMealId });
-
-    const ok = result.status === 200 || result.status === 204;
-    console.log(`  [${c.date}] ${ok ? 'OK' : `FAILED (${result.status})`} — ${c.mealName}: ${c.bestMeal}`);
   }
 
   await browser.close();
